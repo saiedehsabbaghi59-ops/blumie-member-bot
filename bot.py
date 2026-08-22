@@ -51,10 +51,19 @@ async def on_ready():
 @bot.event
 async def on_message(message: Message):
 
-    if not message.content:
-        return
+ if not message.content:
+    return
 
-    if message.content.strip() == "/start":
+if message.content.strip() == "/id":
+
+    await message.reply(
+        f"🆔 User ID شما:\n\n"
+        f"{message.author.user_id}"
+    )
+
+    return
+
+if message.content.strip() == "/start":   
 
         await message.reply(
             "🌸 به ممبرگیر بلومی خوش اومدی!\n\n"
