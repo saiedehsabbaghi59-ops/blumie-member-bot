@@ -24,6 +24,7 @@ def health():
 
 def run_web_server():
     port = int(os.environ.get("PORT", 10000))
+
     app.run(
         host="0.0.0.0",
         port=port
@@ -43,27 +44,37 @@ if not BOT_TOKEN:
 bot = Bot(token=BOT_TOKEN)
 
 
+# =========================
+# آماده شدن بات
+# =========================
+
 @bot.event
 async def on_ready():
     print("🌸 Blumie Bot is ready!")
 
 
+# =========================
+# دریافت پیام‌ها
+# =========================
+
 @bot.event
 async def on_message(message: Message):
 
- if not message.content:
-    return
+    if not message.content:
+        return
 
-if message.content.strip() == "/id":
+    # دستور /id
+    if message.content.strip() == "/id":
 
-    await message.reply(
-        f"🆔 User ID شما:\n\n"
-        f"{message.author.user_id}"
-    )
+        await message.reply(
+            f"🆔 User ID شما:\n\n"
+            f"{message.author.user_id}"
+        )
 
-    return
+        return
 
-if message.content.strip() == "/start":   
+    # دستور /start
+    if message.content.strip() == "/start":
 
         await message.reply(
             "🌸 به ممبرگیر بلومی خوش اومدی!\n\n"
@@ -71,6 +82,8 @@ if message.content.strip() == "/start":
             "برای کانالت سفارش ثبت کنی و از امکانات بلومی استفاده کنی.\n\n"
             "✨ به بلومی خوش اومدی!"
         )
+
+        return
 
 
 # =========================
