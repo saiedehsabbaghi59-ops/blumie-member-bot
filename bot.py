@@ -4,17 +4,30 @@ import threading
 from datetime import datetime, date
 
 from flask import Flask
+
 from bale import (
     Bot,
     Message,
-    CallbackQuery,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton
+    MenuKeyboardMarkup,
+    MenuKeyboardButton
 )
 
 
 # =========================================================
-# تنظیمات Render
+# تنظیمات
+# =========================================================
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+
+# آیدی ادمین خودت
+ADMIN_ID = 652485302
+
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN در Render تنظیم نشده است!")
+
+
+# =========================================================
+# Flask برای Render
 # =========================================================
 
 app = Flask(__name__)
@@ -40,26 +53,14 @@ def run_web_server():
 
 
 # =========================================================
-# تنظیمات بات
+# Bot
 # =========================================================
-
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = os.getenv("ADMIN_ID")
-
-if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN تنظیم نشده است!")
-
-if not ADMIN_ID:
-    raise ValueError("ADMIN_ID تنظیم نشده است!")
-
-
-ADMIN_ID = int(ADMIN_ID)
 
 bot = Bot(token=BOT_TOKEN)
 
 
 # =========================================================
-# دیتابیس
+# Database
 # =========================================================
 
 DB_NAME = "blumie.db"
@@ -68,7 +69,8 @@ DB_NAME = "blumie.db"
 def get_db():
     conn = sqlite3.connect(
         DB_NAME,
-        check_same_thread=False
+        check_same_thread=False,
+        timeout=30
     )
 
     conn.row_factory = sqlite3.Row
@@ -95,7 +97,7 @@ def init_db():
         )
     """)
 
-    # کانال‌های عضویت اجباری
+    # کانال‌های عضویت اجباری اصلی
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS required_channels (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -103,6 +105,34 @@ def init_db():
             title TEXT,
             username TEXT,
             link TEXT
+        )
+    """)
+
+    # کانال‌های کمپین جمع‌آوری سکه
+    # این کانال‌ها همان کانال‌هایی هستند که سفارش کاربران
+    # در آینده می‌تواند آنها را وارد این لیست کند.
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS earning_channels (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id TEXT UNIQUE,
+            title TEXT,
+            username TEXT,
+            link TEXT,
+            reward INTEGER DEFAULT 1,
+            active INTEGER DEFAULT 1,
+            created_at TEXT
+        )
+    """)
+
+    # ثبت اینکه هر کاربر بابت کدام کانال سکه گرفته
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS channel_rewards (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            channel_id INTEGER,
+            reward INTEGER,
+            created_at TEXT,
+            UNIQUE(user_id, channel_id)
         )
     """)
 
@@ -119,7 +149,7 @@ def init_db():
         )
     """)
 
-    # استفاده از کدهای هدیه
+    # استفاده از کد هدیه
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS gift_usages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -134,6 +164,9 @@ def init_db():
         CREATE TABLE IF NOT EXISTS orders (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
+            channel_link TEXT,
+            channel_id TEXT,
+            channel_title TEXT,
             members INTEGER,
             coins INTEGER,
             status TEXT,
@@ -149,14 +182,14 @@ init_db()
 
 
 # =========================================================
-# حالت‌های موقت ادمین
+# حالت‌های موقت کاربران
 # =========================================================
 
-admin_states = {}
+user_states = {}
 
 
 # =========================================================
-# ابزارهای دیتابیس کاربران
+# ذخیره کاربر
 # =========================================================
 
 def save_user(user):
@@ -171,6 +204,9 @@ def save_user(user):
 
     exists = cursor.fetchone()
 
+    first_name = user.first_name or ""
+    username = user.username or ""
+
     if not exists:
 
         cursor.execute("""
@@ -181,13 +217,14 @@ def save_user(user):
                 coins,
                 total_earned,
                 total_spent,
-                joined_at
+                joined_at,
+                last_daily
             )
-            VALUES (?, ?, ?, 0, 0, 0, ?)
+            VALUES (?, ?, ?, 0, 0, 0, ?, NULL)
         """, (
             user.user_id,
-            user.first_name or "",
-            user.username or "",
+            first_name,
+            username,
             datetime.now().isoformat()
         ))
 
@@ -199,14 +236,18 @@ def save_user(user):
                 username = ?
             WHERE user_id = ?
         """, (
-            user.first_name or "",
-            user.username or "",
+            first_name,
+            username,
             user.user_id
         ))
 
     conn.commit()
     conn.close()
 
+
+# =========================================================
+# گرفتن اطلاعات کاربر
+# =========================================================
 
 def get_user(user_id):
 
@@ -218,12 +259,16 @@ def get_user(user_id):
         (user_id,)
     )
 
-    user = cursor.fetchone()
+    result = cursor.fetchone()
 
     conn.close()
 
-    return user
+    return result
 
+
+# =========================================================
+# اضافه کردن سکه
+# =========================================================
 
 def add_coins(user_id, amount):
 
@@ -244,6 +289,10 @@ def add_coins(user_id, amount):
     conn.commit()
     conn.close()
 
+
+# =========================================================
+# کم کردن سکه
+# =========================================================
 
 def remove_coins(user_id, amount):
 
@@ -272,220 +321,163 @@ def remove_coins(user_id, amount):
 
 
 # =========================================================
-# پنل اصلی کاربر
+# منوی اصلی پایین چت
 # =========================================================
 
-def user_panel():
+def main_menu():
 
-    keyboard = InlineKeyboardMarkup()
+    keyboard = MenuKeyboardMarkup()
 
     keyboard.add(
-        InlineKeyboardButton(
-            text="🪙 سکه‌های من",
-            callback_data="user_coins"
-        ),
-        row=1
+        MenuKeyboardButton("🪙 سکه‌های من")
     )
 
     keyboard.add(
-        InlineKeyboardButton(
-            text="🎁 جمع‌آوری سکه",
-            callback_data="collect_coins"
-        ),
-        row=2
+        MenuKeyboardButton("🎁 جمع‌آوری سکه")
     )
 
     keyboard.add(
-        InlineKeyboardButton(
-            text="👥 سفارش ممبر",
-            callback_data="member_order"
-        ),
-        row=3
+        MenuKeyboardButton("👥 سفارش ممبر")
     )
 
     keyboard.add(
-        InlineKeyboardButton(
-            text="💰 خرید سکه",
-            callback_data="buy_coins"
-        ),
-        row=4
+        MenuKeyboardButton("💰 خرید سکه")
     )
 
     keyboard.add(
-        InlineKeyboardButton(
-            text="🎟️ کد هدیه",
-            callback_data="gift_code"
-        ),
-        row=5
+        MenuKeyboardButton("🎟️ کد هدیه")
     )
 
     keyboard.add(
-        InlineKeyboardButton(
-            text="👤 حساب من",
-            callback_data="my_account"
-        ),
-        row=6
+        MenuKeyboardButton("👤 حساب من")
     )
 
     keyboard.add(
-        InlineKeyboardButton(
-            text="📊 فعالیت من",
-            callback_data="my_activity"
-        ),
-        row=7
+        MenuKeyboardButton("📊 فعالیت من")
     )
 
     keyboard.add(
-        InlineKeyboardButton(
-            text="📞 پشتیبانی",
-            callback_data="support"
-        ),
-        row=8
+        MenuKeyboardButton("📞 پشتیبانی")
     )
 
     return keyboard
 
 
 # =========================================================
-# پنل مدیریت
+# منوی مدیریت
 # =========================================================
 
-def admin_panel():
+def admin_menu():
 
-    keyboard = InlineKeyboardMarkup()
+    keyboard = MenuKeyboardMarkup()
 
     keyboard.add(
-        InlineKeyboardButton(
-            text="📢 مدیریت عضویت اجباری",
-            callback_data="admin_channels"
-        ),
-        row=1
+        MenuKeyboardButton("📢 عضویت اجباری")
     )
 
     keyboard.add(
-        InlineKeyboardButton(
-            text="🪙 مدیریت سکه",
-            callback_data="admin_coins"
-        ),
-        row=2
+        MenuKeyboardButton("📣 کانال‌های کسب سکه")
     )
 
     keyboard.add(
-        InlineKeyboardButton(
-            text="🎁 مدیریت کدهای هدیه",
-            callback_data="admin_gifts"
-        ),
-        row=3
+        MenuKeyboardButton("🪙 مدیریت سکه")
     )
 
     keyboard.add(
-        InlineKeyboardButton(
-            text="👥 مدیریت سفارش‌ها",
-            callback_data="admin_orders"
-        ),
-        row=4
+        MenuKeyboardButton("🎁 مدیریت کد هدیه")
     )
 
     keyboard.add(
-        InlineKeyboardButton(
-            text="👤 کاربران",
-            callback_data="admin_users"
-        ),
-        row=5
+        MenuKeyboardButton("👥 سفارش‌ها")
     )
 
     keyboard.add(
-        InlineKeyboardButton(
-            text="📊 آمار ربات",
-            callback_data="admin_stats"
-        ),
-        row=6
+        MenuKeyboardButton("👤 کاربران")
     )
 
     keyboard.add(
-        InlineKeyboardButton(
-            text="🔙 بازگشت",
-            callback_data="back_home"
-        ),
-        row=7
+        MenuKeyboardButton("📊 آمار")
+    )
+
+    keyboard.add(
+        MenuKeyboardButton("🔙 منوی اصلی")
     )
 
     return keyboard
 
 
 # =========================================================
-# پنل مدیریت کانال‌ها
+# منوی عضویت اجباری
 # =========================================================
 
-def channel_admin_panel():
+def required_admin_menu():
 
-    keyboard = InlineKeyboardMarkup()
+    keyboard = MenuKeyboardMarkup()
 
     keyboard.add(
-        InlineKeyboardButton(
-            text="➕ افزودن کانال",
-            callback_data="add_channel"
-        ),
-        row=1
+        MenuKeyboardButton("➕ افزودن عضویت اجباری")
     )
 
     keyboard.add(
-        InlineKeyboardButton(
-            text="🗑️ حذف کانال",
-            callback_data="remove_channel"
-        ),
-        row=2
+        MenuKeyboardButton("🗑️ حذف عضویت اجباری")
     )
 
     keyboard.add(
-        InlineKeyboardButton(
-            text="📋 لیست کانال‌ها",
-            callback_data="list_channels"
-        ),
-        row=3
+        MenuKeyboardButton("📋 لیست عضویت اجباری")
     )
 
     keyboard.add(
-        InlineKeyboardButton(
-            text="🔙 بازگشت",
-            callback_data="admin_back"
-        ),
-        row=4
+        MenuKeyboardButton("🔙 پنل مدیریت")
     )
 
     return keyboard
 
 
 # =========================================================
-# پنل کدهای هدیه
+# منوی کانال‌های کسب سکه
 # =========================================================
 
-def gift_admin_panel():
+def earning_admin_menu():
 
-    keyboard = InlineKeyboardMarkup()
+    keyboard = MenuKeyboardMarkup()
 
     keyboard.add(
-        InlineKeyboardButton(
-            text="➕ ساخت کد هدیه",
-            callback_data="create_gift"
-        ),
-        row=1
+        MenuKeyboardButton("➕ افزودن کانال کسب سکه")
     )
 
     keyboard.add(
-        InlineKeyboardButton(
-            text="📋 لیست کدها",
-            callback_data="list_gifts"
-        ),
-        row=2
+        MenuKeyboardButton("🗑️ حذف کانال کسب سکه")
     )
 
     keyboard.add(
-        InlineKeyboardButton(
-            text="🔙 بازگشت",
-            callback_data="admin_back"
-        ),
-        row=3
+        MenuKeyboardButton("📋 لیست کانال‌های کسب سکه")
+    )
+
+    keyboard.add(
+        MenuKeyboardButton("🔙 پنل مدیریت")
+    )
+
+    return keyboard
+
+
+# =========================================================
+# منوی کد هدیه
+# =========================================================
+
+def gift_admin_menu():
+
+    keyboard = MenuKeyboardMarkup()
+
+    keyboard.add(
+        MenuKeyboardButton("➕ ساخت کد هدیه")
+    )
+
+    keyboard.add(
+        MenuKeyboardButton("📋 لیست کدهای هدیه")
+    )
+
+    keyboard.add(
+        MenuKeyboardButton("🔙 پنل مدیریت")
     )
 
     return keyboard
@@ -528,7 +520,7 @@ async def check_required_membership(user_id):
         except Exception as error:
 
             print(
-                "Membership check error:",
+                "Required membership error:",
                 error
             )
 
@@ -538,44 +530,33 @@ async def check_required_membership(user_id):
 
 
 # =========================================================
-# پنل عضویت اجباری
+# نمایش کانال‌های عضویت اجباری
 # =========================================================
 
-def required_membership_panel(channels):
+def required_text(channels):
 
-    keyboard = InlineKeyboardMarkup()
-
-    row = 1
-
-    for channel in channels:
-
-        link = channel["link"]
-
-        if link:
-
-            keyboard.add(
-                InlineKeyboardButton(
-                    text=f"📢 {channel['title']}",
-                    url=link
-                ),
-                row=row
-            )
-
-            row += 1
-
-    keyboard.add(
-        InlineKeyboardButton(
-            text="✅ بررسی عضویت",
-            callback_data="check_membership"
-        ),
-        row=row
+    text = (
+        "🔒 برای استفاده از بلومی باید ابتدا "
+        "در کانال‌های زیر عضو بشی:\n\n"
     )
 
-    return keyboard
+    for index, channel in enumerate(channels, 1):
+
+        text += (
+            f"{index}. 📢 {channel['title']}\n"
+            f"🔗 {channel['link']}\n\n"
+        )
+
+    text += (
+        "بعد از عضویت در همه کانال‌ها، "
+        "کلمه «بررسی عضویت» رو بفرست."
+    )
+
+    return text
 
 
 # =========================================================
-# پیام خوش‌آمدگویی
+# صفحه اصلی
 # =========================================================
 
 async def send_home(message):
@@ -591,38 +572,38 @@ async def send_home(message):
     if not is_member:
 
         await message.reply(
-            "🔒 برای استفاده از بلومی باید ابتدا "
-            "در کانال‌های زیر عضو بشی:\n\n"
-            "بعد از عضویت روی «بررسی عضویت» بزن 🌸",
-            components=required_membership_panel(channels)
+            required_text(channels)
         )
 
         return
 
     await message.reply(
         "🌸✨ به ممبرگیر بلومی خوش اومدی!\n\n"
-        "🪙 اینجا می‌تونی سکه جمع کنی\n"
-        "👥 برای کانالت ممبر سفارش بدی\n"
-        "🎁 کدهای هدیه استفاده کنی\n"
-        "💰 سکه خریداری کنی\n\n"
-        "یکی از گزینه‌های زیر رو انتخاب کن 👇",
-        components=user_panel()
+        "🪙 سکه جمع کن\n"
+        "👥 برای کانالت ممبر سفارش بده\n"
+        "🎁 کد هدیه استفاده کن\n"
+        "💰 سکه بخر\n\n"
+        "از منوی پایین چت استفاده کن 👇",
+        components=main_menu()
     )
 
 
 # =========================================================
-# آماده شدن بات
+# آماده شدن
 # =========================================================
 
 @bot.event
 async def on_ready():
 
-    print("🌸 Blumie Bot is ready!")
-    print("🗄️ Database loaded!")
+    print("================================")
+    print("🌸 BLUMIE BOT IS READY!")
+    print("👑 ADMIN ID:", ADMIN_ID)
+    print("🗄️ DATABASE: OK")
+    print("================================")
 
 
 # =========================================================
-# دریافت پیام
+# پیام‌ها
 # =========================================================
 
 @bot.event
@@ -637,9 +618,28 @@ async def on_message(message: Message):
 
     text = message.content.strip()
 
-    # ---------------------------------------------
-    # دستور ID
-    # ---------------------------------------------
+    print(
+        f"Message from {user.user_id}: {text}"
+    )
+
+    # =====================================================
+    # /start
+    # =====================================================
+
+    if text == "/start":
+
+        user_states.pop(
+            user.user_id,
+            None
+        )
+
+        await send_home(message)
+
+        return
+
+    # =====================================================
+    # /id
+    # =====================================================
 
     if text == "/id":
 
@@ -650,19 +650,9 @@ async def on_message(message: Message):
 
         return
 
-    # ---------------------------------------------
-    # دستور Start
-    # ---------------------------------------------
-
-    if text == "/start":
-
-        await send_home(message)
-
-        return
-
-    # ---------------------------------------------
-    # پنل مدیریت
-    # ---------------------------------------------
+    # =====================================================
+    # /admin
+    # =====================================================
 
     if text == "/admin":
 
@@ -674,247 +664,16 @@ async def on_message(message: Message):
 
             return
 
-        await message.reply(
-            "👑 پنل مدیریت بلومی\n\n"
-            "یکی از بخش‌های زیر را انتخاب کن:",
-            components=admin_panel()
+        user_states.pop(
+            user.user_id,
+            None
         )
 
-        return
-
-    # =================================================
-    # حالت‌های ورود اطلاعات ادمین
-    # =================================================
-
-    if user.user_id == ADMIN_ID:
-
-        state = admin_states.get(user.user_id)
-
-        # ---------------------------------------------
-        # افزودن کانال
-        # ---------------------------------------------
-
-        if state == "waiting_channel":
-
-            channel_input = text
-
-            if not (
-                channel_input.startswith("@")
-                or channel_input.startswith("http://")
-                or channel_input.startswith("https://")
-            ):
-
-                await message.reply(
-                    "❌ لینک یا آیدی کانال درست نیست.\n\n"
-                    "مثلاً:\n"
-                    "@mychannel\n\n"
-                    "یا:\n"
-                    "https://ble.ir/mychannel"
-                )
-
-                return
-
-            try:
-
-                chat = await bot.get_chat(
-                    channel_input
-                )
-
-                if not chat:
-
-                    await message.reply(
-                        "❌ کانال پیدا نشد.\n"
-                        "مطمئن شو ربات به کانال دسترسی دارد."
-                    )
-
-                    return
-
-                title = chat.title or "کانال بدون نام"
-
-                username = chat.username or ""
-
-                if username:
-
-                    link = f"https://ble.ir/{username}"
-
-                else:
-
-                    link = channel_input
-
-                conn = get_db()
-                cursor = conn.cursor()
-
-                try:
-
-                    cursor.execute("""
-                        INSERT INTO required_channels (
-                            chat_id,
-                            title,
-                            username,
-                            link
-                        )
-                        VALUES (?, ?, ?, ?)
-                    """, (
-                        str(chat.id),
-                        title,
-                        username,
-                        link
-                    ))
-
-                    conn.commit()
-
-                    await message.reply(
-                        "✅ کانال با موفقیت اضافه شد!\n\n"
-                        f"📢 {title}\n"
-                        f"🔗 {link}"
-                    )
-
-                except sqlite3.IntegrityError:
-
-                    await message.reply(
-                        "⚠️ این کانال قبلاً اضافه شده است."
-                    )
-
-                finally:
-
-                    conn.close()
-
-                admin_states.pop(
-                    user.user_id,
-                    None
-                )
-
-                return
-
-            except Exception as error:
-
-                print(
-                    "Add channel error:",
-                    error
-                )
-
-                await message.reply(
-                    "❌ نتونستم کانال رو پیدا کنم.\n\n"
-                    "اول مطمئن شو ربات داخل کانال هست "
-                    "و دسترسی مدیریتی مناسب دارد."
-                )
-
-                return
-
-        # ---------------------------------------------
-        # ساخت کد هدیه
-        # ---------------------------------------------
-
-        if state == "waiting_gift":
-
-            parts = text.split()
-
-            if len(parts) != 3:
-
-                await message.reply(
-                    "❌ فرمت اشتباهه.\n\n"
-                    "اینطوری بفرست:\n\n"
-                    "CODE 20 50\n\n"
-                    "یعنی:\n"
-                    "CODE = کد هدیه\n"
-                    "20 = تعداد سکه\n"
-                    "50 = حداکثر تعداد استفاده"
-                )
-
-                return
-
-            code = parts[0].upper()
-
-            try:
-
-                coins = int(parts[1])
-                max_users = int(parts[2])
-
-                if coins <= 0 or max_users <= 0:
-
-                    raise ValueError
-
-            except ValueError:
-
-                await message.reply(
-                    "❌ تعداد سکه و تعداد کاربران "
-                    "باید عدد مثبت باشند."
-                )
-
-                return
-
-            conn = get_db()
-            cursor = conn.cursor()
-
-            try:
-
-                cursor.execute("""
-                    INSERT INTO gift_codes (
-                        code,
-                        coins,
-                        max_users,
-                        created_at
-                    )
-                    VALUES (?, ?, ?, ?)
-                """, (
-                    code,
-                    coins,
-                    max_users,
-                    datetime.now().isoformat()
-                ))
-
-                conn.commit()
-
-                await message.reply(
-                    "🎁 کد هدیه ساخته شد!\n\n"
-                    f"🎟️ کد: {code}\n"
-                    f"🪙 سکه: {coins}\n"
-                    f"👥 ظرفیت: {max_users}"
-                )
-
-            except sqlite3.IntegrityError:
-
-                await message.reply(
-                    "❌ این کد قبلاً ساخته شده."
-                )
-
-            finally:
-
-                conn.close()
-
-            admin_states.pop(
-                user.user_id,
-                None
-            )
-
-            return
-
-
-# =========================================================
-# Callback ها
-# =========================================================
-
-@bot.event
-async def on_callback(callback: CallbackQuery):
-
-    data = callback.data
-
-    if not data:
-        return
-
-    user = callback.from_user
-
-    save_user(user)
-
-    # =====================================================
-    # بازگشت به خانه
-    # =====================================================
-
-    if data == "back_home":
-
-        await callback.message.reply(
-            "🌸 پنل اصلی بلومی:",
-            components=user_panel()
+        await message.reply(
+            "👑 پنل مدیریت بلومی\n\n"
+            "خوش اومدی مدیر 🌸\n"
+            "یکی از گزینه‌های پایین رو انتخاب کن:",
+            components=admin_menu()
         )
 
         return
@@ -923,7 +682,7 @@ async def on_callback(callback: CallbackQuery):
     # بررسی عضویت
     # =====================================================
 
-    if data == "check_membership":
+    if text == "بررسی عضویت":
 
         is_member, channels = await check_required_membership(
             user.user_id
@@ -931,37 +690,664 @@ async def on_callback(callback: CallbackQuery):
 
         if not is_member:
 
-            await callback.message.reply(
+            await message.reply(
                 "❌ هنوز عضویتت کامل نشده.\n\n"
-                "اول در همه کانال‌ها عضو شو و دوباره "
-                "روی بررسی عضویت بزن.",
-                components=required_membership_panel(channels)
+                + required_text(channels)
             )
 
             return
 
-        await callback.message.reply(
+        await message.reply(
             "✅ عضویتت تأیید شد!\n\n"
             "🌸 حالا می‌تونی از بلومی استفاده کنی.",
-            components=user_panel()
+            components=main_menu()
         )
 
         return
 
     # =====================================================
-    # سکه‌های من
+    # اگر کاربر در حالت خاصی است
     # =====================================================
 
-    if data == "user_coins":
+    state = user_states.get(user.user_id)
 
-        user_data = get_user(user.user_id)
+    # =====================================================
+    # ورود کانال سفارش
+    # =====================================================
 
-        coins = user_data["coins"]
+    if state == "order_channel":
 
-        await callback.message.reply(
-            "🪙 موجودی سکه شما:\n\n"
-            f"💰 {coins} سکه",
-            components=user_panel()
+        channel_input = text
+
+        if not (
+            channel_input.startswith("@")
+            or channel_input.startswith("http://")
+            or channel_input.startswith("https://")
+        ):
+
+            await message.reply(
+                "❌ آیدی یا لینک کانالت درست نیست.\n\n"
+                "مثال:\n"
+                "@mychannel\n\n"
+                "یا:\n"
+                "https://ble.ir/mychannel"
+            )
+
+            return
+
+        try:
+
+            chat = await bot.get_chat(
+                channel_input
+            )
+
+            if not chat:
+
+                await message.reply(
+                    "❌ کانال پیدا نشد."
+                )
+
+                return
+
+            user_states[user.user_id] = {
+                "state": "order_members",
+                "channel_input": channel_input,
+                "channel_id": str(chat.id),
+                "channel_title": chat.title or "کانال"
+            }
+
+            await message.reply(
+                "👥 خیلی خوب!\n\n"
+                "حالا تعداد ممبری که می‌خوای سفارش بدی رو بفرست.\n\n"
+                "مثلاً:\n"
+                "100"
+            )
+
+        except Exception as error:
+
+            print(
+                "Order channel error:",
+                error
+            )
+
+            await message.reply(
+                "❌ نتونستم کانالت رو پیدا کنم.\n\n"
+                "مطمئن شو لینک یا آیدی کانال درست باشه "
+                "و ربات دسترسی لازم رو داشته باشه."
+            )
+
+        return
+
+    # =====================================================
+    # تعداد ممبر سفارش
+    # =====================================================
+
+    if isinstance(state, dict) and state.get("state") == "order_members":
+
+        try:
+
+            members = int(text)
+
+            if members <= 0:
+                raise ValueError
+
+        except ValueError:
+
+            await message.reply(
+                "❌ تعداد ممبر باید یک عدد مثبت باشه."
+            )
+
+            return
+
+        coins = members * 2
+
+        user_data = get_user(
+            user.user_id
+        )
+
+        if user_data["coins"] < coins:
+
+            await message.reply(
+                "❌ سکه کافی نداری.\n\n"
+                f"👥 تعداد ممبر: {members}\n"
+                f"🪙 هزینه: {coins} سکه\n"
+                f"💰 موجودی تو: {user_data['coins']} سکه\n\n"
+                "اول سکه جمع کن یا سکه بخر.",
+                components=main_menu()
+            )
+
+            user_states.pop(
+                user.user_id,
+                None
+            )
+
+            return
+
+        # کم کردن سکه
+        success = remove_coins(
+            user.user_id,
+            coins
+        )
+
+        if not success:
+
+            await message.reply(
+                "❌ انجام سفارش ممکن نشد؛ "
+                "موجودی سکه کافی نیست."
+            )
+
+            user_states.pop(
+                user.user_id,
+                None
+            )
+
+            return
+
+        channel_input = state["channel_input"]
+        channel_id = state["channel_id"]
+        channel_title = state["channel_title"]
+
+        conn = get_db()
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            INSERT INTO orders (
+                user_id,
+                channel_link,
+                channel_id,
+                channel_title,
+                members,
+                coins,
+                status,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            user.user_id,
+            channel_input,
+            channel_id,
+            channel_title,
+            members,
+            coins,
+            "pending",
+            datetime.now().isoformat()
+        ))
+
+        order_id = cursor.lastrowid
+
+        # =================================================
+        # کانال سفارش‌دهنده وارد لیست کسب سکه می‌شود
+        # =================================================
+
+        try:
+
+            cursor.execute("""
+                INSERT OR IGNORE INTO earning_channels (
+                    chat_id,
+                    title,
+                    username,
+                    link,
+                    reward,
+                    active,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, 1, 1, ?)
+            """, (
+                channel_id,
+                channel_title,
+                "",
+                channel_input,
+                datetime.now().isoformat()
+            ))
+
+        except Exception as error:
+
+            print(
+                "Add earning channel error:",
+                error
+            )
+
+        conn.commit()
+        conn.close()
+
+        user_states.pop(
+            user.user_id,
+            None
+        )
+
+        await message.reply(
+            "🎉 سفارش با موفقیت ثبت شد!\n\n"
+            f"🆔 شماره سفارش: {order_id}\n"
+            f"📢 کانال: {channel_title}\n"
+            f"👥 تعداد ممبر: {members}\n"
+            f"🪙 هزینه: {coins} سکه\n\n"
+            "⏳ وضعیت سفارش: در انتظار بررسی\n\n"
+            "📣 کانال تو هم به لیست جمع‌آوری سکه "
+            "اضافه شد تا کاربران دیگر با عضویت در آن "
+            "بتوانند سکه بگیرند.",
+            components=main_menu()
+        )
+
+        return
+
+    # =====================================================
+    # افزودن کانال عضویت اجباری
+    # =====================================================
+
+    if user.user_id == ADMIN_ID and state == "required_add":
+
+        channel_input = text
+
+        if not (
+            channel_input.startswith("@")
+            or channel_input.startswith("http://")
+            or channel_input.startswith("https://")
+        ):
+
+            await message.reply(
+                "❌ لینک یا آیدی کانال درست نیست."
+            )
+
+            return
+
+        try:
+
+            chat = await bot.get_chat(
+                channel_input
+            )
+
+            if not chat:
+
+                await message.reply(
+                    "❌ کانال پیدا نشد."
+                )
+
+                return
+
+            title = chat.title or "کانال"
+            username = chat.username or ""
+            link = channel_input
+
+            conn = get_db()
+            cursor = conn.cursor()
+
+            try:
+
+                cursor.execute("""
+                    INSERT INTO required_channels (
+                        chat_id,
+                        title,
+                        username,
+                        link
+                    )
+                    VALUES (?, ?, ?, ?)
+                """, (
+                    str(chat.id),
+                    title,
+                    username,
+                    link
+                ))
+
+                conn.commit()
+
+                await message.reply(
+                    "✅ کانال عضویت اجباری اضافه شد!\n\n"
+                    f"📢 {title}\n"
+                    f"🔗 {link}",
+                    components=required_admin_menu()
+                )
+
+            except sqlite3.IntegrityError:
+
+                await message.reply(
+                    "⚠️ این کانال قبلاً وجود دارد.",
+                    components=required_admin_menu()
+                )
+
+            finally:
+
+                conn.close()
+
+        except Exception as error:
+
+            print(
+                "Required channel error:",
+                error
+            )
+
+            await message.reply(
+                "❌ نتونستم کانال رو پیدا کنم."
+            )
+
+        user_states.pop(
+            user.user_id,
+            None
+        )
+
+        return
+
+    # =====================================================
+    # افزودن کانال کسب سکه توسط ادمین
+    # =====================================================
+
+    if user.user_id == ADMIN_ID and state == "earning_add":
+
+        channel_input = text
+
+        if not (
+            channel_input.startswith("@")
+            or channel_input.startswith("http://")
+            or channel_input.startswith("https://")
+        ):
+
+            await message.reply(
+                "❌ لینک یا آیدی کانال درست نیست."
+            )
+
+            return
+
+        try:
+
+            chat = await bot.get_chat(
+                channel_input
+            )
+
+            if not chat:
+
+                await message.reply(
+                    "❌ کانال پیدا نشد."
+                )
+
+                return
+
+            title = chat.title or "کانال"
+            username = chat.username or ""
+
+            conn = get_db()
+            cursor = conn.cursor()
+
+            try:
+
+                cursor.execute("""
+                    INSERT INTO earning_channels (
+                        chat_id,
+                        title,
+                        username,
+                        link,
+                        reward,
+                        active,
+                        created_at
+                    )
+                    VALUES (?, ?, ?, ?, 1, 1, ?)
+                """, (
+                    str(chat.id),
+                    title,
+                    username,
+                    channel_input,
+                    datetime.now().isoformat()
+                ))
+
+                conn.commit()
+
+                await message.reply(
+                    "✅ کانال کسب سکه اضافه شد!\n\n"
+                    f"📢 {title}\n"
+                    f"🪙 پاداش عضویت: ۱ سکه",
+                    components=earning_admin_menu()
+                )
+
+            except sqlite3.IntegrityError:
+
+                await message.reply(
+                    "⚠️ این کانال قبلاً وجود دارد.",
+                    components=earning_admin_menu()
+                )
+
+            finally:
+
+                conn.close()
+
+        except Exception as error:
+
+            print(
+                "Earning channel error:",
+                error
+            )
+
+            await message.reply(
+                "❌ نتونستم کانال رو پیدا کنم."
+            )
+
+        user_states.pop(
+            user.user_id,
+            None
+        )
+
+        return
+
+    # =====================================================
+    # ساخت کد هدیه
+    # =====================================================
+
+    if user.user_id == ADMIN_ID and state == "gift_add":
+
+        parts = text.split()
+
+        if len(parts) != 3:
+
+            await message.reply(
+                "❌ فرمت اشتباهه.\n\n"
+                "مثال:\n"
+                "BLUMIE20 20 50\n\n"
+                "BLUMIE20 = کد\n"
+                "20 = سکه\n"
+                "50 = ظرفیت استفاده"
+            )
+
+            return
+
+        code = parts[0].upper()
+
+        try:
+
+            coins = int(parts[1])
+            max_users = int(parts[2])
+
+            if coins <= 0 or max_users <= 0:
+                raise ValueError
+
+        except ValueError:
+
+            await message.reply(
+                "❌ تعداد سکه و ظرفیت باید عدد مثبت باشند."
+            )
+
+            return
+
+        conn = get_db()
+        cursor = conn.cursor()
+
+        try:
+
+            cursor.execute("""
+                INSERT INTO gift_codes (
+                    code,
+                    coins,
+                    max_users,
+                    used_users,
+                    active,
+                    created_at
+                )
+                VALUES (?, ?, ?, 0, 1, ?)
+            """, (
+                code,
+                coins,
+                max_users,
+                datetime.now().isoformat()
+            ))
+
+            conn.commit()
+
+            await message.reply(
+                "🎉 کد هدیه ساخته شد!\n\n"
+                f"🎟️ کد: {code}\n"
+                f"🪙 سکه: {coins}\n"
+                f"👥 ظرفیت: {max_users}",
+                components=gift_admin_menu()
+            )
+
+        except sqlite3.IntegrityError:
+
+            await message.reply(
+                "❌ این کد قبلاً ساخته شده.",
+                components=gift_admin_menu()
+            )
+
+        finally:
+
+            conn.close()
+
+        user_states.pop(
+            user.user_id,
+            None
+        )
+
+        return
+
+    # =====================================================
+    # استفاده از کد هدیه
+    # =====================================================
+
+    if state is None and text not in [
+        "🪙 سکه‌های من",
+        "🎁 جمع‌آوری سکه",
+        "👥 سفارش ممبر",
+        "💰 خرید سکه",
+        "🎟️ کد هدیه",
+        "👤 حساب من",
+        "📊 فعالیت من",
+        "📞 پشتیبانی",
+        "📢 عضویت اجباری",
+        "📣 کانال‌های کسب سکه",
+        "🪙 مدیریت سکه",
+        "🎁 مدیریت کد هدیه",
+        "👥 سفارش‌ها",
+        "👤 کاربران",
+        "📊 آمار",
+        "🔙 منوی اصلی"
+    ]:
+
+        # اگر متن شبیه کد هدیه بود
+        code = text.upper()
+
+        conn = get_db()
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            SELECT *
+            FROM gift_codes
+            WHERE code = ?
+              AND active = 1
+        """, (
+            code,
+        ))
+
+        gift = cursor.fetchone()
+
+        if gift:
+
+            cursor.execute("""
+                SELECT id
+                FROM gift_usages
+                WHERE code = ?
+                  AND user_id = ?
+            """, (
+                code,
+                user.user_id
+            ))
+
+            already_used = cursor.fetchone()
+
+            if already_used:
+
+                conn.close()
+
+                await message.reply(
+                    "⚠️ این کد هدیه رو قبلاً استفاده کردی.",
+                    components=main_menu()
+                )
+
+                return
+
+            if gift["used_users"] >= gift["max_users"]:
+
+                conn.close()
+
+                await message.reply(
+                    "❌ ظرفیت این کد هدیه تکمیل شده.",
+                    components=main_menu()
+                )
+
+                return
+
+            cursor.execute("""
+                INSERT INTO gift_usages (
+                    code,
+                    user_id
+                )
+                VALUES (?, ?)
+            """, (
+                code,
+                user.user_id
+            ))
+
+            cursor.execute("""
+                UPDATE gift_codes
+                SET used_users = used_users + 1
+                WHERE code = ?
+            """, (
+                code,
+            ))
+
+            cursor.execute("""
+                UPDATE users
+                SET coins = coins + ?,
+                    total_earned = total_earned + ?
+                WHERE user_id = ?
+            """, (
+                gift["coins"],
+                gift["coins"],
+                user.user_id
+            ))
+
+            conn.commit()
+            conn.close()
+
+            await message.reply(
+                "🎉 کد هدیه با موفقیت فعال شد!\n\n"
+                f"🎟️ کد: {code}\n"
+                f"🪙 {gift['coins']} سکه به حسابت اضافه شد.",
+                components=main_menu()
+            )
+
+            return
+
+        conn.close()
+
+    # =====================================================
+    # منوی اصلی کاربر
+    # =====================================================
+
+    if text == "🪙 سکه‌های من":
+
+        user_data = get_user(
+            user.user_id
+        )
+
+        await message.reply(
+            "🪙 موجودی شما:\n\n"
+            f"💰 {user_data['coins']} سکه",
+            components=main_menu()
         )
 
         return
@@ -970,18 +1356,17 @@ async def on_callback(callback: CallbackQuery):
     # جمع‌آوری سکه
     # =====================================================
 
-    if data == "collect_coins":
+    if text == "🎁 جمع‌آوری سکه":
 
-        user_data = get_user(user.user_id)
+        is_member, channels = await check_required_membership(
+            user.user_id
+        )
 
-        today = str(date.today())
+        if not is_member:
 
-        if user_data["last_daily"] == today:
-
-            await callback.message.reply(
-                "🎁 سکه روزانه امروزت رو قبلاً گرفتی!\n\n"
-                "⏰ فردا دوباره می‌تونی ۵ سکه بگیری.",
-                components=user_panel()
+            await message.reply(
+                "🔒 اول باید عضویت اجباری رو کامل کنی.\n\n"
+                + required_text(channels)
             )
 
             return
@@ -990,24 +1375,111 @@ async def on_callback(callback: CallbackQuery):
         cursor = conn.cursor()
 
         cursor.execute("""
-            UPDATE users
-            SET coins = coins + 5,
-                total_earned = total_earned + 5,
-                last_daily = ?
-            WHERE user_id = ?
-        """, (
-            today,
-            user.user_id
-        ))
+            SELECT *
+            FROM earning_channels
+            WHERE active = 1
+        """)
+
+        earning_channels = cursor.fetchall()
+
+        if not earning_channels:
+
+            conn.close()
+
+            await message.reply(
+                "🎁 فعلاً کانالی برای جمع‌آوری سکه وجود نداره.\n\n"
+                "بعداً دوباره امتحان کن.",
+                components=main_menu()
+            )
+
+            return
+
+        total_reward = 0
+        successful_channels = 0
+
+        for channel in earning_channels:
+
+            try:
+
+                member = await bot.get_chat_member(
+                    channel["chat_id"],
+                    user.user_id
+                )
+
+                if member and member.is_member:
+
+                    cursor.execute("""
+                        SELECT id
+                        FROM channel_rewards
+                        WHERE user_id = ?
+                          AND channel_id = ?
+                    """, (
+                        user.user_id,
+                        channel["id"]
+                    ))
+
+                    already_rewarded = cursor.fetchone()
+
+                    if not already_rewarded:
+
+                        reward = channel["reward"]
+
+                        cursor.execute("""
+                            INSERT INTO channel_rewards (
+                                user_id,
+                                channel_id,
+                                reward,
+                                created_at
+                            )
+                            VALUES (?, ?, ?, ?)
+                        """, (
+                            user.user_id,
+                            channel["id"],
+                            reward,
+                            datetime.now().isoformat()
+                        ))
+
+                        cursor.execute("""
+                            UPDATE users
+                            SET coins = coins + ?,
+                                total_earned = total_earned + ?
+                            WHERE user_id = ?
+                        """, (
+                            reward,
+                            reward,
+                            user.user_id
+                        ))
+
+                        total_reward += reward
+                        successful_channels += 1
+
+            except Exception as error:
+
+                print(
+                    "Earning channel check error:",
+                    error
+                )
 
         conn.commit()
         conn.close()
 
-        await callback.message.reply(
-            "🎉 تبریک!\n\n"
-            "🪙 ۵ سکه روزانه به حسابت اضافه شد.",
-            components=user_panel()
-        )
+        if total_reward > 0:
+
+            await message.reply(
+                "🎉 سکه‌ها با موفقیت اضافه شدند!\n\n"
+                f"📢 تعداد کانال‌های جدید: {successful_channels}\n"
+                f"🪙 سکه دریافت‌شده: {total_reward}",
+                components=main_menu()
+            )
+
+        else:
+
+            await message.reply(
+                "ℹ️ این بار سکه جدیدی برایت پیدا نشد.\n\n"
+                "اگر قبلاً سکه کانال‌ها رو گرفتی، "
+                "دوباره برای همان کانال سکه نمی‌گیری.",
+                components=main_menu()
+            )
 
         return
 
@@ -1015,14 +1487,17 @@ async def on_callback(callback: CallbackQuery):
     # سفارش ممبر
     # =====================================================
 
-    if data == "member_order":
+    if text == "👥 سفارش ممبر":
 
-        await callback.message.reply(
-            "👥 سفارش ممبر\n\n"
-            "📌 قیمت فعلی:\n"
+        user_states[user.user_id] = "order_channel"
+
+        await message.reply(
+            "👥 ثبت سفارش ممبر\n\n"
+            "📌 قیمت:\n"
             "هر ممبر = ۲ سکه\n\n"
-            "🛠️ بخش ثبت سفارش در مرحله بعد فعال می‌شود.",
-            components=user_panel()
+            "🔗 اول لینک یا آیدی کانالت رو بفرست.\n\n"
+            "مثال:\n"
+            "@mychannel"
         )
 
         return
@@ -1031,15 +1506,17 @@ async def on_callback(callback: CallbackQuery):
     # خرید سکه
     # =====================================================
 
-    if data == "buy_coins":
+    if text == "💰 خرید سکه":
 
-        await callback.message.reply(
+        await message.reply(
             "💰 خرید سکه\n\n"
-            "🪙 قیمت هر سکه: ۲۰۰ تومان\n"
+            "🪙 قیمت هر سکه: ۲۰۰ تومان\n\n"
             "🔹 حداقل خرید: ۱۰۰ سکه\n"
-            "🔹 حداکثر خرید: ۵۰۰ سکه\n\n"
-            "🛠️ پرداخت آنلاین در مرحله بعد فعال می‌شود.",
-            components=user_panel()
+            "💵 قیمت: ۲۰٬۰۰۰ تومان\n\n"
+            "🔹 حداکثر خرید: ۵۰۰ سکه\n"
+            "💵 قیمت: ۱۰۰٬۰۰۰ تومان\n\n"
+            "⚠️ در این نسخه پرداخت آنلاین هنوز فعال نشده.",
+            components=main_menu()
         )
 
         return
@@ -1048,12 +1525,11 @@ async def on_callback(callback: CallbackQuery):
     # کد هدیه
     # =====================================================
 
-    if data == "gift_code":
+    if text == "🎟️ کد هدیه":
 
-        await callback.message.reply(
+        await message.reply(
             "🎟️ کد هدیه\n\n"
-            "کد هدیه‌ای که از بلومی گرفتی رو "
-            "به صورت پیام برای ربات ارسال کن.\n\n"
+            "کد هدیه‌ات رو همینجا ارسال کن.\n\n"
             "مثال:\n"
             "BLUMIE20"
         )
@@ -1064,35 +1540,39 @@ async def on_callback(callback: CallbackQuery):
     # حساب من
     # =====================================================
 
-    if data == "my_account":
+    if text == "👤 حساب من":
 
-        user_data = get_user(user.user_id)
+        user_data = get_user(
+            user.user_id
+        )
 
-        await callback.message.reply(
+        await message.reply(
             "👤 حساب کاربری\n\n"
             f"🆔 شناسه: {user.user_id}\n"
             f"👤 نام: {user_data['first_name']}\n"
             f"🪙 سکه: {user_data['coins']}",
-            components=user_panel()
+            components=main_menu()
         )
 
         return
 
     # =====================================================
-    # فعالیت من
+    # فعالیت
     # =====================================================
 
-    if data == "my_activity":
+    if text == "📊 فعالیت من":
 
-        user_data = get_user(user.user_id)
+        user_data = get_user(
+            user.user_id
+        )
 
-        await callback.message.reply(
+        await message.reply(
             "📊 فعالیت من\n\n"
             f"🪙 کل سکه‌های دریافت‌شده: "
             f"{user_data['total_earned']}\n\n"
             f"💸 کل سکه‌های مصرف‌شده: "
             f"{user_data['total_spent']}",
-            components=user_panel()
+            components=main_menu()
         )
 
         return
@@ -1101,203 +1581,156 @@ async def on_callback(callback: CallbackQuery):
     # پشتیبانی
     # =====================================================
 
-    if data == "support":
+    if text == "📞 پشتیبانی":
 
-        await callback.message.reply(
+        await message.reply(
             "📞 پشتیبانی بلومی\n\n"
-            "اگر مشکلی داشتی، پیام خودت رو برای "
-            "پشتیبانی ارسال کن.\n\n"
-            "🛠️ سیستم تیکت پشتیبانی در مرحله بعد "
-            "تکمیل می‌شود.",
-            components=user_panel()
+            "پیامت رو برای پشتیبانی ارسال کن.\n\n"
+            "🛠️ سیستم تیکت در نسخه بعدی تکمیل می‌شود.",
+            components=main_menu()
         )
 
         return
 
     # =====================================================
-    # بررسی ادمین
+    # ================= پنل مدیریت ========================
     # =====================================================
 
-    if user.user_id != ADMIN_ID:
+    if user.user_id == ADMIN_ID:
 
-        if data.startswith("admin_") or data in [
-            "add_channel",
-            "remove_channel",
-            "list_channels",
-            "create_gift",
-            "list_gifts"
-        ]:
+        # -------------------------------------------------
+        # عضویت اجباری
+        # -------------------------------------------------
 
-            await callback.message.reply(
-                "⛔ دسترسی غیرمجاز."
+        if text == "📢 عضویت اجباری":
+
+            await message.reply(
+                "📢 مدیریت عضویت اجباری",
+                components=required_admin_menu()
             )
 
             return
 
-    # =====================================================
-    # پنل مدیریت
-    # =====================================================
+        if text == "➕ افزودن عضویت اجباری":
 
-    if data == "admin_back":
+            user_states[user.user_id] = "required_add"
 
-        await callback.message.reply(
-            "👑 پنل مدیریت:",
-            components=admin_panel()
-        )
-
-        return
-
-    # =====================================================
-    # مدیریت عضویت اجباری
-    # =====================================================
-
-    if data == "admin_channels":
-
-        await callback.message.reply(
-            "📢 مدیریت عضویت اجباری\n\n"
-            "از این قسمت می‌تونی کانال‌هایی که "
-            "کاربر باید عضو آن‌ها باشد را مدیریت کنی.",
-            components=channel_admin_panel()
-        )
-
-        return
-
-    # =====================================================
-    # افزودن کانال
-    # =====================================================
-
-    if data == "add_channel":
-
-        admin_states[user.user_id] = "waiting_channel"
-
-        await callback.message.reply(
-            "➕ افزودن کانال\n\n"
-            "لینک یا آیدی کانال رو بفرست.\n\n"
-            "مثال:\n"
-            "@mychannel\n\n"
-            "یا:\n"
-            "https://ble.ir/mychannel"
-        )
-
-        return
-
-    # =====================================================
-    # لیست کانال‌ها
-    # =====================================================
-
-    if data == "list_channels":
-
-        conn = get_db()
-        cursor = conn.cursor()
-
-        cursor.execute(
-            "SELECT * FROM required_channels"
-        )
-
-        channels = cursor.fetchall()
-
-        conn.close()
-
-        if not channels:
-
-            await callback.message.reply(
-                "📋 هنوز هیچ کانالی برای عضویت اجباری "
-                "ثبت نشده.",
-                components=channel_admin_panel()
+            await message.reply(
+                "➕ افزودن کانال عضویت اجباری\n\n"
+                "لینک یا آیدی کانال رو بفرست.\n\n"
+                "مثال:\n"
+                "@mychannel"
             )
 
             return
 
-        text = "📋 کانال‌های عضویت اجباری:\n\n"
+        if text == "📋 لیست عضویت اجباری":
 
-        for index, channel in enumerate(
-            channels,
-            start=1
-        ):
+            conn = get_db()
+            cursor = conn.cursor()
 
-            text += (
-                f"{index}. 📢 {channel['title']}\n"
-                f"🔗 {channel['link']}\n\n"
+            cursor.execute(
+                "SELECT * FROM required_channels"
             )
 
-        await callback.message.reply(
-            text,
-            components=channel_admin_panel()
-        )
+            channels = cursor.fetchall()
 
-        return
+            conn.close()
 
-    # =====================================================
-    # حذف کانال
-    # =====================================================
+            if not channels:
 
-    if data == "remove_channel":
-
-        conn = get_db()
-        cursor = conn.cursor()
-
-        cursor.execute(
-            "SELECT * FROM required_channels"
-        )
-
-        channels = cursor.fetchall()
-
-        conn.close()
-
-        if not channels:
-
-            await callback.message.reply(
-                "🗑️ هیچ کانالی برای حذف وجود ندارد.",
-                components=channel_admin_panel()
-            )
-
-            return
-
-        keyboard = InlineKeyboardMarkup()
-
-        for channel in channels:
-
-            keyboard.add(
-                InlineKeyboardButton(
-                    text=f"🗑️ {channel['title']}",
-                    callback_data=f"delete_channel:{channel['id']}"
+                await message.reply(
+                    "📋 هیچ کانال عضویت اجباری ثبت نشده.",
+                    components=required_admin_menu()
                 )
+
+                return
+
+            result = "📋 کانال‌های عضویت اجباری:\n\n"
+
+            for index, channel in enumerate(channels, 1):
+
+                result += (
+                    f"{index}. {channel['title']}\n"
+                    f"🔗 {channel['link']}\n\n"
+                )
+
+            await message.reply(
+                result,
+                components=required_admin_menu()
             )
 
-        keyboard.add(
-            InlineKeyboardButton(
-                text="🔙 بازگشت",
-                callback_data="admin_channels"
-            ),
-            row=len(channels) + 1
-        )
+            return
 
-        await callback.message.reply(
-            "🗑️ کانالی که می‌خوای حذف کنی رو انتخاب کن:",
-            components=keyboard
-        )
+        if text == "🗑️ حذف عضویت اجباری":
 
-        return
+            conn = get_db()
+            cursor = conn.cursor()
 
-    # =====================================================
-    # حذف یک کانال
-    # =====================================================
+            cursor.execute(
+                "SELECT * FROM required_channels"
+            )
 
-    if data.startswith("delete_channel:"):
+            channels = cursor.fetchall()
 
-        channel_id = data.split(":")[1]
+            conn.close()
 
-        conn = get_db()
-        cursor = conn.cursor()
+            if not channels:
 
-        cursor.execute(
-            "SELECT title FROM required_channels WHERE id = ?",
-            (channel_id,)
-        )
+                await message.reply(
+                    "هیچ کانالی وجود ندارد.",
+                    components=required_admin_menu()
+                )
 
-        channel = cursor.fetchone()
+                return
 
-        if channel:
+            result = (
+                "🗑️ برای حذف کانال، "
+                "شماره آن را بفرست.\n\n"
+            )
+
+            for index, channel in enumerate(channels, 1):
+
+                result += (
+                    f"{index}. {channel['title']}\n"
+                )
+
+            user_states[user.user_id] = {
+                "state": "required_delete",
+                "channels": [dict(c) for c in channels]
+            }
+
+            await message.reply(result)
+
+            return
+
+        # -------------------------------------------------
+        # حذف عضویت اجباری با شماره
+        # -------------------------------------------------
+
+        if isinstance(state, dict) and state.get("state") == "required_delete":
+
+            try:
+
+                index = int(text)
+
+                channels = state["channels"]
+
+                if index < 1 or index > len(channels):
+                    raise ValueError
+
+                channel_id = channels[index - 1]["id"]
+
+            except ValueError:
+
+                await message.reply(
+                    "❌ شماره درست نیست."
+                )
+
+                return
+
+            conn = get_db()
+            cursor = conn.cursor()
 
             cursor.execute(
                 "DELETE FROM required_channels WHERE id = ?",
@@ -1305,207 +1738,436 @@ async def on_callback(callback: CallbackQuery):
             )
 
             conn.commit()
+            conn.close()
 
-        conn.close()
-
-        if channel:
-
-            await callback.message.reply(
-                f"✅ کانال «{channel['title']}» حذف شد.",
-                components=channel_admin_panel()
+            user_states.pop(
+                user.user_id,
+                None
             )
 
-        else:
-
-            await callback.message.reply(
-                "❌ کانال پیدا نشد.",
-                components=channel_admin_panel()
-            )
-
-        return
-
-    # =====================================================
-    # مدیریت سکه
-    # =====================================================
-
-    if data == "admin_coins":
-
-        await callback.message.reply(
-            "🪙 مدیریت سکه\n\n"
-            "سیستم کامل مدیریت سکه در حال آماده‌سازی است.\n\n"
-            "قیمت فعلی:\n"
-            "🪙 هر سکه = ۲۰۰ تومان\n"
-            "🔹 حداقل خرید = ۱۰۰ سکه\n"
-            "🔹 حداکثر خرید = ۵۰۰ سکه",
-            components=admin_panel()
-        )
-
-        return
-
-    # =====================================================
-    # مدیریت کد هدیه
-    # =====================================================
-
-    if data == "admin_gifts":
-
-        await callback.message.reply(
-            "🎁 مدیریت کدهای هدیه",
-            components=gift_admin_panel()
-        )
-
-        return
-
-    # =====================================================
-    # ساخت کد هدیه
-    # =====================================================
-
-    if data == "create_gift":
-
-        admin_states[user.user_id] = "waiting_gift"
-
-        await callback.message.reply(
-            "➕ ساخت کد هدیه\n\n"
-            "فرمت زیر رو بفرست:\n\n"
-            "CODE 20 50\n\n"
-            "یعنی:\n"
-            "🎟️ CODE = نام کد\n"
-            "🪙 20 = تعداد سکه\n"
-            "👥 50 = حداکثر تعداد استفاده"
-        )
-
-        return
-
-    # =====================================================
-    # لیست کدهای هدیه
-    # =====================================================
-
-    if data == "list_gifts":
-
-        conn = get_db()
-        cursor = conn.cursor()
-
-        cursor.execute(
-            "SELECT * FROM gift_codes ORDER BY id DESC"
-        )
-
-        gifts = cursor.fetchall()
-
-        conn.close()
-
-        if not gifts:
-
-            await callback.message.reply(
-                "🎁 هنوز هیچ کد هدیه‌ای ساخته نشده.",
-                components=gift_admin_panel()
+            await message.reply(
+                "✅ کانال حذف شد.",
+                components=required_admin_menu()
             )
 
             return
 
-        text = "🎁 کدهای هدیه:\n\n"
+        # -------------------------------------------------
+        # کانال‌های کسب سکه
+        # -------------------------------------------------
 
-        for gift in gifts:
+        if text == "📣 کانال‌های کسب سکه":
 
-            status = (
-                "🟢 فعال"
-                if gift["active"]
-                else "🔴 غیرفعال"
+            await message.reply(
+                "📣 مدیریت کانال‌های کسب سکه",
+                components=earning_admin_menu()
             )
 
-            text += (
-                f"🎟️ {gift['code']}\n"
-                f"🪙 {gift['coins']} سکه\n"
-                f"👥 {gift['used_users']}/{gift['max_users']}\n"
-                f"{status}\n\n"
+            return
+
+        if text == "➕ افزودن کانال کسب سکه":
+
+            user_states[user.user_id] = "earning_add"
+
+            await message.reply(
+                "➕ کانال کسب سکه\n\n"
+                "لینک یا آیدی کانال رو بفرست.\n\n"
+                "هر کاربر با عضویت در این کانال "
+                "۱ سکه دریافت می‌کند."
             )
 
-        await callback.message.reply(
-            text,
-            components=gift_admin_panel()
-        )
+            return
 
-        return
+        if text == "📋 لیست کانال‌های کسب سکه":
+
+            conn = get_db()
+            cursor = conn.cursor()
+
+            cursor.execute("""
+                SELECT *
+                FROM earning_channels
+                WHERE active = 1
+            """)
+
+            channels = cursor.fetchall()
+
+            conn.close()
+
+            if not channels:
+
+                await message.reply(
+                    "📋 هنوز کانال کسب سکه‌ای وجود ندارد.",
+                    components=earning_admin_menu()
+                )
+
+                return
+
+            result = "📋 کانال‌های کسب سکه:\n\n"
+
+            for index, channel in enumerate(channels, 1):
+
+                result += (
+                    f"{index}. {channel['title']}\n"
+                    f"🪙 پاداش: {channel['reward']} سکه\n"
+                    f"🔗 {channel['link']}\n\n"
+                )
+
+            await message.reply(
+                result,
+                components=earning_admin_menu()
+            )
+
+            return
+
+        if text == "🗑️ حذف کانال کسب سکه":
+
+            conn = get_db()
+            cursor = conn.cursor()
+
+            cursor.execute("""
+                SELECT *
+                FROM earning_channels
+                WHERE active = 1
+            """)
+
+            channels = cursor.fetchall()
+
+            conn.close()
+
+            if not channels:
+
+                await message.reply(
+                    "هیچ کانالی برای حذف وجود ندارد.",
+                    components=earning_admin_menu()
+                )
+
+                return
+
+            user_states[user.user_id] = {
+                "state": "earning_delete",
+                "channels": [dict(c) for c in channels]
+            }
+
+            result = (
+                "🗑️ شماره کانالی که می‌خوای حذف کنی رو بفرست:\n\n"
+            )
+
+            for index, channel in enumerate(channels, 1):
+
+                result += (
+                    f"{index}. {channel['title']}\n"
+                )
+
+            await message.reply(result)
+
+            return
+
+        if isinstance(state, dict) and state.get("state") == "earning_delete":
+
+            try:
+
+                index = int(text)
+
+                channels = state["channels"]
+
+                if index < 1 or index > len(channels):
+                    raise ValueError
+
+                channel_id = channels[index - 1]["id"]
+
+            except ValueError:
+
+                await message.reply(
+                    "❌ شماره درست نیست."
+                )
+
+                return
+
+            conn = get_db()
+            cursor = conn.cursor()
+
+            cursor.execute(
+                "DELETE FROM earning_channels WHERE id = ?",
+                (channel_id,)
+            )
+
+            conn.commit()
+            conn.close()
+
+            user_states.pop(
+                user.user_id,
+                None
+            )
+
+            await message.reply(
+                "✅ کانال کسب سکه حذف شد.",
+                components=earning_admin_menu()
+            )
+
+            return
+
+        # -------------------------------------------------
+        # مدیریت سکه
+        # -------------------------------------------------
+
+        if text == "🪙 مدیریت سکه":
+
+            await message.reply(
+                "🪙 مدیریت سکه\n\n"
+                "💰 هر سکه = ۲۰۰ تومان\n"
+                "🔹 حداقل خرید = ۱۰۰ سکه\n"
+                "🔹 حداکثر خرید = ۵۰۰ سکه\n"
+                "🎁 سکه روزانه = ۵\n"
+                "📢 عضویت در کانال کسب سکه = ۱ سکه\n"
+                "👥 هر ممبر سفارش = ۲ سکه",
+                components=admin_menu()
+            )
+
+            return
+
+        # -------------------------------------------------
+        # مدیریت هدیه
+        # -------------------------------------------------
+
+        if text == "🎁 مدیریت کد هدیه":
+
+            await message.reply(
+                "🎁 مدیریت کدهای هدیه",
+                components=gift_admin_menu()
+            )
+
+            return
+
+        if text == "➕ ساخت کد هدیه":
+
+            user_states[user.user_id] = "gift_add"
+
+            await message.reply(
+                "➕ ساخت کد هدیه\n\n"
+                "فرمت:\n\n"
+                "BLUMIE20 20 50\n\n"
+                "یعنی:\n"
+                "🎟️ کد = BLUMIE20\n"
+                "🪙 سکه = 20\n"
+                "👥 ظرفیت = 50"
+            )
+
+            return
+
+        if text == "📋 لیست کدهای هدیه":
+
+            conn = get_db()
+            cursor = conn.cursor()
+
+            cursor.execute("""
+                SELECT *
+                FROM gift_codes
+                ORDER BY id DESC
+            """)
+
+            gifts = cursor.fetchall()
+
+            conn.close()
+
+            if not gifts:
+
+                await message.reply(
+                    "🎁 هیچ کد هدیه‌ای ساخته نشده.",
+                    components=gift_admin_menu()
+                )
+
+                return
+
+            result = "🎁 کدهای هدیه:\n\n"
+
+            for gift in gifts:
+
+                status = (
+                    "🟢 فعال"
+                    if gift["active"]
+                    else "🔴 غیرفعال"
+                )
+
+                result += (
+                    f"🎟️ {gift['code']}\n"
+                    f"🪙 {gift['coins']} سکه\n"
+                    f"👥 {gift['used_users']}/{gift['max_users']}\n"
+                    f"{status}\n\n"
+                )
+
+            await message.reply(
+                result,
+                components=gift_admin_menu()
+            )
+
+            return
+
+        # -------------------------------------------------
+        # سفارش‌ها
+        # -------------------------------------------------
+
+        if text == "👥 سفارش‌ها":
+
+            conn = get_db()
+            cursor = conn.cursor()
+
+            cursor.execute("""
+                SELECT *
+                FROM orders
+                ORDER BY id DESC
+                LIMIT 30
+            """)
+
+            orders = cursor.fetchall()
+
+            conn.close()
+
+            if not orders:
+
+                await message.reply(
+                    "👥 هنوز سفارشی ثبت نشده.",
+                    components=admin_menu()
+                )
+
+                return
+
+            result = "👥 آخرین سفارش‌ها:\n\n"
+
+            for order in orders:
+
+                result += (
+                    f"🆔 سفارش #{order['id']}\n"
+                    f"👤 کاربر: {order['user_id']}\n"
+                    f"📢 کانال: {order['channel_title']}\n"
+                    f"👥 ممبر: {order['members']}\n"
+                    f"🪙 سکه: {order['coins']}\n"
+                    f"📌 وضعیت: {order['status']}\n\n"
+                )
+
+            await message.reply(
+                result,
+                components=admin_menu()
+            )
+
+            return
+
+        # -------------------------------------------------
+        # کاربران
+        # -------------------------------------------------
+
+        if text == "👤 کاربران":
+
+            conn = get_db()
+            cursor = conn.cursor()
+
+            cursor.execute(
+                "SELECT COUNT(*) AS count FROM users"
+            )
+
+            users = cursor.fetchone()["count"]
+
+            conn.close()
+
+            await message.reply(
+                "👤 کاربران بلومی\n\n"
+                f"👥 تعداد کاربران: {users}",
+                components=admin_menu()
+            )
+
+            return
+
+        # -------------------------------------------------
+        # آمار
+        # -------------------------------------------------
+
+        if text == "📊 آمار":
+
+            conn = get_db()
+            cursor = conn.cursor()
+
+            cursor.execute(
+                "SELECT COUNT(*) AS count FROM users"
+            )
+            users = cursor.fetchone()["count"]
+
+            cursor.execute(
+                "SELECT COUNT(*) AS count FROM required_channels"
+            )
+            required = cursor.fetchone()["count"]
+
+            cursor.execute(
+                "SELECT COUNT(*) AS count FROM earning_channels WHERE active = 1"
+            )
+            earning = cursor.fetchone()["count"]
+
+            cursor.execute(
+                "SELECT COUNT(*) AS count FROM orders"
+            )
+            orders = cursor.fetchone()["count"]
+
+            cursor.execute("""
+                SELECT COALESCE(SUM(coins), 0) AS total
+                FROM users
+            """)
+
+            coins = cursor.fetchone()["total"]
+
+            conn.close()
+
+            await message.reply(
+                "📊 آمار بلومی\n\n"
+                f"👥 کاربران: {users}\n"
+                f"🔒 عضویت اجباری: {required}\n"
+                f"📣 کانال‌های کسب سکه: {earning}\n"
+                f"👥 سفارش‌ها: {orders}\n"
+                f"🪙 مجموع سکه کاربران: {coins}",
+                components=admin_menu()
+            )
+
+            return
+
+        # -------------------------------------------------
+        # بازگشت به پنل مدیریت
+        # -------------------------------------------------
+
+        if text == "🔙 پنل مدیریت":
+
+            user_states.pop(
+                user.user_id,
+                None
+            )
+
+            await message.reply(
+                "👑 پنل مدیریت",
+                components=admin_menu()
+            )
+
+            return
+
+        # -------------------------------------------------
+        # بازگشت به منوی اصلی
+        # -------------------------------------------------
+
+        if text == "🔙 منوی اصلی":
+
+            user_states.pop(
+                user.user_id,
+                None
+            )
+
+            await message.reply(
+                "🌸 منوی اصلی بلومی",
+                components=main_menu()
+            )
+
+            return
 
     # =====================================================
-    # استفاده از کد هدیه
+    # سکه روزانه
     # =====================================================
-
-    if data == "admin_orders":
-
-        await callback.message.reply(
-            "👥 مدیریت سفارش‌ها\n\n"
-            "بخش سفارش‌ها بعد از فعال شدن "
-            "سیستم ثبت سفارش تکمیل می‌شود.",
-            components=admin_panel()
-        )
-
-        return
-
+    # این بخش را عمداً با یک دکمه جدا نکردیم.
+    # چون جمع‌آوری سکه باید از کانال‌ها انجام شود.
     # =====================================================
-    # کاربران
-    # =====================================================
-
-    if data == "admin_users":
-
-        conn = get_db()
-        cursor = conn.cursor()
-
-        cursor.execute(
-            "SELECT COUNT(*) AS count FROM users"
-        )
-
-        count = cursor.fetchone()["count"]
-
-        conn.close()
-
-        await callback.message.reply(
-            "👤 کاربران بلومی\n\n"
-            f"👥 تعداد کاربران ثبت‌شده: {count}",
-            components=admin_panel()
-        )
-
-        return
-
-    # =====================================================
-    # آمار
-    # =====================================================
-
-    if data == "admin_stats":
-
-        conn = get_db()
-        cursor = conn.cursor()
-
-        cursor.execute(
-            "SELECT COUNT(*) AS count FROM users"
-        )
-        users = cursor.fetchone()["count"]
-
-        cursor.execute(
-            "SELECT COUNT(*) AS count FROM required_channels"
-        )
-        channels = cursor.fetchone()["count"]
-
-        cursor.execute(
-            "SELECT COALESCE(SUM(coins), 0) AS total FROM users"
-        )
-        coins = cursor.fetchone()["total"]
-
-        cursor.execute(
-            "SELECT COUNT(*) AS count FROM orders"
-        )
-        orders = cursor.fetchone()["count"]
-
-        conn.close()
-
-        await callback.message.reply(
-            "📊 آمار بلومی\n\n"
-            f"👥 کاربران: {users}\n"
-            f"📢 کانال‌های اجباری: {channels}\n"
-            f"🪙 مجموع سکه کاربران: {coins}\n"
-            f"👥 سفارش‌ها: {orders}",
-            components=admin_panel()
-        )
-
-        return
 
 
 # =========================================================
